@@ -1,0 +1,17 @@
+[package]
+name = "bababooey"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+description = "A tool to generate WIT files from Rust hyperprocess implementations"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+syn = { version = "2.0", features = ["full", "parsing", "extra-traits"] }
+walkdir = "2.3"
+toml = "0.7"
+
+[[bin]]
+name = "bababooey"
+path = "src/main.rs"
