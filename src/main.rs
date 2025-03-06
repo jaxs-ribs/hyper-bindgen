@@ -412,20 +412,20 @@ fn generate_interface_wit_content(
                 let return_type = match &sig.output {
                     syn::ReturnType::Type(_, ty) => {
                         let rt = rust_type_to_wit(&*ty, &mut used_types)?;
-                        println!("      Return type: {}", rt);
-                        rt
+                        println!("      Return type: {} -> result<{}, string>", rt, rt);
+                        format!("result<{}, string>", rt)
                     }
                     _ => {
-                        println!("      Return type: unit (default)");
-                        "unit".to_string()
+                        println!("      Return type: unit -> result<unit, string>");
+                        "result<unit, string>".to_string()
                     }
                 };
                 
                 let func_sig = if params.is_empty() {
-                    format!("    {}: func() -> {};", kebab_name, return_type) // Add semicolon
+                    format!("    {}: func(target: address) -> {};", kebab_name, return_type) // Add semicolon
                 } else {
                     format!(
-                        "    {}: func({}) -> {};",
+                        "    {}: func(target: address, {}) -> {};",
                         kebab_name,
                         params.join(", "), // Use comma separator
                         return_type
@@ -482,9 +482,9 @@ fn generate_interface_wit_content(
     } else {
         // Combine type definitions and functions within the interface block
         let combined_content = if type_defs.is_empty() {
-            functions.join("\n")
+            format!("    use standard.{{address}};\n\n{}", functions.join("\n"))
         } else {
-            format!("{}\n\n{}", type_defs.join("\n\n"), functions.join("\n"))
+            format!("    use standard.{{address}};\n\n{}\n\n{}", type_defs.join("\n\n"), functions.join("\n"))
         };
         
         let content = format!("interface {} {{\n{}\n}}\n", kebab_interface_name, combined_content);
@@ -588,9 +588,9 @@ fn process_rust_project(project_path: &Path, api_dir: &Path) -> Result<Option<St
     }
     
     if let (Some(_), Some(_), Some(kebab_iface)) = (wit_world, interface_name, kebab_interface_name) {
-        println!("Returning export statement for interface {}", kebab_iface);
-        // Use kebab-case interface name for export
-        Ok(Some(format!("    export {};", kebab_iface)))
+        println!("Returning import statement for interface {}", kebab_iface);
+        // Use kebab-case interface name for import
+        Ok(Some(format!("    import {};", kebab_iface)))
     } else {
         println!("No valid interface found");
         Ok(None)
@@ -642,15 +642,15 @@ fn main() -> Result<()> {
         
         match process_rust_project(&project_path, &api_dir) {
             Ok(Some(import)) => {
-                println!("Got export statement: {}", import);
+                println!("Got import statement: {}", import);
                 world_imports.push(import);
             },
-            Ok(None) => println!("No export statement generated"),
+            Ok(None) => println!("No import statement generated"),
             Err(e) => println!("Error processing project: {}", e),
         }
     }
     
-    println!("Collected {} world exports", world_imports.len());
+    println!("Collected {} world imports", world_imports.len());
     
     // Check for existing world definition files and update them
     println!("Looking for existing world definition files");
@@ -682,11 +682,11 @@ fn main() -> Result<()> {
                             
                             world_names.insert(clean_name.to_string());
                             
-                            // Create updated world content - use export instead of import
+                            // Create updated world content - use import
                             let world_content = format!(
                                 "world {} {{\n{}\n    include process-v1;\n}}",
                                 clean_name,
-                                world_imports.join("\n") // No comma separator because each export has a semicolon
+                                world_imports.join("\n") // No comma separator because each import has a semicolon
                             );
                             
                             println!("Writing updated world definition to {}", path.display());
@@ -714,7 +714,7 @@ fn main() -> Result<()> {
         let world_content = format!(
             "world {} {{\n{}\n    include process-v1;\n}}",
             default_world,
-            world_imports.join("\n") // No comma separator because each export has a semicolon
+            world_imports.join("\n") // No comma separator because each import has a semicolon
         );
         
         let world_file = api_dir.join(format!("{}.wit", default_world));
