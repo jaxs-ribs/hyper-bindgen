@@ -1215,3 +1215,4 @@ fn to_pascal_case(s: &str) -> String {
     
     result
 }
+// TODO: Note that this is only going to work once wit files support async, because we can only generate sync function stubs. Going to use another method for now. 
