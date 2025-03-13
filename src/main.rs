@@ -570,7 +570,7 @@ fn process_rust_project(project_path: &Path, api_dir: &Path) -> Result<Option<(S
         }
     }
     
-    if let (Some(_main_world), Some(_), Some(kebab_iface)) = (wit_world, interface_name, kebab_interface_name) {
+    if let (Some(main_world), Some(_), Some(kebab_iface)) = (wit_world, interface_name, kebab_interface_name) {
         println!("Returning import statement for interface {}", kebab_iface);
         // Return the kebab interface name and its corresponding individual world name
         let world_name = format!("{}-api-v0", kebab_iface);
@@ -595,7 +595,7 @@ impl AsTypePath for syn::Type {
     }
 }
 
-fn generate_wit_files() -> Result<()> {
+fn main() -> Result<()> {
     // Get the current working directory
     let cwd = std::env::current_dir()?;
     println!("Current working directory: {}", cwd.display());
@@ -627,8 +627,8 @@ fn generate_wit_files() -> Result<()> {
         match process_rust_project(&project_path, &api_dir) {
             Ok(Some((interface_name, world_name))) => {
                 println!("Got interface: {} and its world: {}", interface_name, world_name);
-                // Import the individual world in the main world
-                world_imports.push(format!("    import {};", world_name));
+                // Import the interface directly in the main world (not the API world)
+                world_imports.push(format!("    import {};", interface_name));
                 
                 // Extract the main world name from the first project (they should all use the same)
                 if main_world_name.is_none() {
@@ -681,9 +681,7 @@ fn generate_wit_files() -> Result<()> {
     
     println!("WIT files generated successfully in the 'api' directory.");
     Ok(())
-
 }
-
 
 // Find all relevant Rust projects
 fn find_rust_projects(base_dir: &Path) -> Vec<PathBuf> {
@@ -731,15 +729,4 @@ fn find_rust_projects(base_dir: &Path) -> Vec<PathBuf> {
     
     println!("Found {} relevant Rust projects", projects.len());
     projects
-}
-
-fn main() -> Result<()> {
-    generate_wit_files()?;
-    generate_wit_implementations()?;
-    Ok(())
-}
-
-fn generate_wit_implementations() -> Result<()> {
-    // TODO: Implement this, and only write below, not above. 
-    Ok(())
 }
