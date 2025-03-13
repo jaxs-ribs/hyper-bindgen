@@ -277,54 +277,6 @@ fn collect_type_definitions(ast: &syn::File) -> Result<HashMap<String, String>> 
     Ok(type_defs)
 }
 
-// Find all relevant Rust projects
-fn find_rust_projects(base_dir: &Path) -> Vec<PathBuf> {
-    let mut projects = Vec::new();
-    println!("Scanning for Rust projects in {}", base_dir.display());
-    
-    for entry in WalkDir::new(base_dir)
-        .max_depth(1)
-        .into_iter()
-        .filter_map(Result::ok)
-    {
-        let path = entry.path();
-        
-        if path.is_dir() && path != base_dir {
-            let cargo_toml = path.join("Cargo.toml");
-            println!("Checking {}", cargo_toml.display());
-            
-            if cargo_toml.exists() {
-                // Try to read and parse Cargo.toml
-                if let Ok(content) = fs::read_to_string(&cargo_toml) {
-                    if let Ok(cargo_data) = content.parse::<Value>() {
-                        // Check for the specific metadata
-                        if let Some(metadata) = cargo_data
-                            .get("package")
-                            .and_then(|p| p.get("metadata"))
-                            .and_then(|m| m.get("component"))
-                        {
-                            if let Some(package) = metadata.get("package") {
-                                if let Some(package_str) = package.as_str() {
-                                    println!("  Found package.metadata.component.package = {:?}", package_str);
-                                    if package_str == "hyperware:process" {
-                                        println!("  Adding project: {}", path.display());
-                                        projects.push(path.to_path_buf());
-                                    }
-                                }
-                            }
-                        } else {
-                            println!("  No package.metadata.component metadata found");
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    println!("Found {} relevant Rust projects", projects.len());
-    projects
-}
-
 // Generate WIT content for an interface
 fn generate_interface_wit_content(
     impl_item: &syn::ItemImpl,
@@ -421,15 +373,35 @@ fn generate_interface_wit_content(
                     }
                 };
                 
-                let func_sig = if params.is_empty() {
-                    format!("    {}: func(target: address) -> {};", kebab_name, return_type) // Add semicolon
+                // Generate attribute comments with proper indentation
+                let mut attr_comments = Vec::new();
+                if has_remote {
+                    attr_comments.push("    //remote");
+                }
+                if has_local {
+                    attr_comments.push("    //local");
+                }
+                if has_http {
+                    attr_comments.push("    //http");
+                }
+                let attr_comment_str = if !attr_comments.is_empty() {
+                    format!("{}\n", attr_comments.join("\n"))
                 } else {
-                    format!(
-                        "    {}: func(target: address, {}) -> {};",
+                    String::new()
+                };
+                
+                let func_sig = if params.is_empty() {
+                    format!("{}    {}: func(target: address) -> {};", 
+                        attr_comment_str,
+                        kebab_name, 
+                        return_type) 
+                } else {
+                    format!("{}    {}: func(target: address, {}) -> {};",
+                        attr_comment_str,
                         kebab_name,
                         params.join(", "), // Use comma separator
                         return_type
-                    ) // Add semicolon
+                    ) 
                 };
                 
                 println!("    Added function: {}", func_sig);
@@ -588,9 +560,9 @@ fn process_rust_project(project_path: &Path, api_dir: &Path) -> Result<Option<St
     }
     
     if let (Some(_), Some(_), Some(kebab_iface)) = (wit_world, interface_name, kebab_interface_name) {
-        println!("Returning import statement for interface {}", kebab_iface);
-        // Use kebab-case interface name for import
-        Ok(Some(format!("    import {};", kebab_iface)))
+        println!("Returning export statement for interface {}", kebab_iface);
+        // Use kebab-case interface name for export (changed from import to export)
+        Ok(Some(format!("    export {};", kebab_iface)))
     } else {
         println!("No valid interface found");
         Ok(None)
@@ -633,24 +605,24 @@ fn main() -> Result<()> {
     
     println!("Found {} relevant Rust projects.", projects.len());
     
-    // Process each project and collect world imports
-    let mut world_imports = Vec::new();
+    // Process each project and collect world exports
+    let mut world_exports = Vec::new();
     let mut world_names = HashSet::new();
     
     for project_path in projects {
         println!("Processing project: {}", project_path.display());
         
         match process_rust_project(&project_path, &api_dir) {
-            Ok(Some(import)) => {
-                println!("Got import statement: {}", import);
-                world_imports.push(import);
+            Ok(Some(export)) => {
+                println!("Got export statement: {}", export);
+                world_exports.push(export);
             },
-            Ok(None) => println!("No import statement generated"),
+            Ok(None) => println!("No export statement generated"),
             Err(e) => println!("Error processing project: {}", e),
         }
     }
     
-    println!("Collected {} world imports", world_imports.len());
+    println!("Collected {} world exports", world_exports.len());
     
     // Check for existing world definition files and update them
     println!("Looking for existing world definition files");
@@ -682,11 +654,11 @@ fn main() -> Result<()> {
                             
                             world_names.insert(clean_name.to_string());
                             
-                            // Create updated world content - use import
+                            // Create updated world content - use export instead of import
                             let world_content = format!(
                                 "world {} {{\n{}\n    include process-v1;\n}}",
                                 clean_name,
-                                world_imports.join("\n") // No comma separator because each import has a semicolon
+                                world_exports.join("\n") // No comma separator because each export has a semicolon
                             );
                             
                             println!("Writing updated world definition to {}", path.display());
@@ -703,18 +675,18 @@ fn main() -> Result<()> {
     }
     
     // If no world definitions were found, create a default one
-    if world_names.is_empty() && !world_imports.is_empty() {
+    if world_names.is_empty() && !world_exports.is_empty() {
         // Define default world name
         let default_world = "async-app-template-dot-os-v0";
         println!("No existing world definitions found, creating default with name: {}", default_world);
         
         // We don't need to validate world names for digits
         
-        // Create world content with process-v1 include
+        // Create world content with process-v1 include, using export instead of import
         let world_content = format!(
             "world {} {{\n{}\n    include process-v1;\n}}",
             default_world,
-            world_imports.join("\n") // No comma separator because each import has a semicolon
+            world_exports.join("\n") // No comma separator because each export has a semicolon
         );
         
         let world_file = api_dir.join(format!("{}.wit", default_world));
@@ -728,4 +700,52 @@ fn main() -> Result<()> {
     
     println!("WIT files generated successfully in the 'api' directory.");
     Ok(())
+}
+
+// Find all relevant Rust projects
+fn find_rust_projects(base_dir: &Path) -> Vec<PathBuf> {
+    let mut projects = Vec::new();
+    println!("Scanning for Rust projects in {}", base_dir.display());
+    
+    for entry in WalkDir::new(base_dir)
+        .max_depth(1)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        let path = entry.path();
+        
+        if path.is_dir() && path != base_dir {
+            let cargo_toml = path.join("Cargo.toml");
+            println!("Checking {}", cargo_toml.display());
+            
+            if cargo_toml.exists() {
+                // Try to read and parse Cargo.toml
+                if let Ok(content) = fs::read_to_string(&cargo_toml) {
+                    if let Ok(cargo_data) = content.parse::<Value>() {
+                        // Check for the specific metadata
+                        if let Some(metadata) = cargo_data
+                            .get("package")
+                            .and_then(|p| p.get("metadata"))
+                            .and_then(|m| m.get("component"))
+                        {
+                            if let Some(package) = metadata.get("package") {
+                                if let Some(package_str) = package.as_str() {
+                                    println!("  Found package.metadata.component.package = {:?}", package_str);
+                                    if package_str == "hyperware:process" {
+                                        println!("  Adding project: {}", path.display());
+                                        projects.push(path.to_path_buf());
+                                    }
+                                }
+                            }
+                        } else {
+                            println!("  No package.metadata.component metadata found");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    println!("Found {} relevant Rust projects", projects.len());
+    projects
 }
