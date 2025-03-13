@@ -570,7 +570,7 @@ fn process_rust_project(project_path: &Path, api_dir: &Path) -> Result<Option<(S
         }
     }
     
-    if let (Some(main_world), Some(_), Some(kebab_iface)) = (wit_world, interface_name, kebab_interface_name) {
+    if let (Some(_main_world), Some(_), Some(kebab_iface)) = (wit_world, interface_name, kebab_interface_name) {
         println!("Returning import statement for interface {}", kebab_iface);
         // Return the kebab interface name and its corresponding individual world name
         let world_name = format!("{}-api-v0", kebab_iface);
@@ -595,7 +595,8 @@ impl AsTypePath for syn::Type {
     }
 }
 
-fn main() -> Result<()> {
+
+fn generate_signatures() -> Result<()> {
     // Get the current working directory
     let cwd = std::env::current_dir()?;
     println!("Current working directory: {}", cwd.display());
@@ -729,4 +730,488 @@ fn find_rust_projects(base_dir: &Path) -> Vec<PathBuf> {
     
     println!("Found {} relevant Rust projects", projects.len());
     projects
+}
+
+fn main() -> Result<()> {
+    generate_signatures()?;
+    generate_implementations()?;
+    Ok(())
+}
+
+#[derive(Clone)]
+struct WitFunction {
+    name: String,
+    params: Vec<(String, String)>, // (name, type)
+    return_type: String,
+    attributes: Vec<String>, // local, remote, http, etc.
+}
+
+fn generate_implementations() -> Result<()> {
+    // Get the current working directory
+    let cwd = std::env::current_dir()?;
+    println!("Current working directory: {}", cwd.display());
+    
+    // Create the target/wit directory if it doesn't exist
+    let target_wit_dir = cwd.join("target").join("wit");
+    println!("Target WIT directory: {}", target_wit_dir.display());
+    
+    fs::create_dir_all(&target_wit_dir)?;
+    println!("Created or verified target/wit directory");
+    
+    // Get all generated API WIT files
+    let api_dir = cwd.join("api");
+    let mut api_interfaces = Vec::new();
+    
+    println!("Scanning for API WIT files in {}", api_dir.display());
+    
+    // Check if api directory exists
+    if !api_dir.exists() {
+        println!("API directory does not exist. Run the tool first to generate WIT files.");
+        return Ok(());
+    }
+    
+    // Iterate through the api directory
+    for entry in fs::read_dir(&api_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        
+        if path.is_file() && path.extension().map_or(false, |ext| ext == "wit") {
+            // Check if filename ends with -api-v0.wit
+            let filename = path.file_stem().unwrap().to_string_lossy().to_string();
+            if filename.ends_with("-api-v0") {
+                println!("Found API WIT file: {}", path.display());
+                
+                // Extract interface name from the filename
+                // Format is interface-name-api-v0.wit, so remove -api-v0 suffix
+                let interface_name = filename.trim_end_matches("-api-v0");
+                
+                // Now prepare to copy it to target/wit
+                fs::copy(&path, &target_wit_dir.join(path.file_name().unwrap()))?;
+                
+                // Copy the interface file as well
+                let interface_filename = format!("{}.wit", interface_name);
+                let interface_path = api_dir.join(&interface_filename);
+                
+                if interface_path.exists() {
+                    println!("Copying interface file: {}", interface_path.display());
+                    fs::copy(&interface_path, &target_wit_dir.join(&interface_filename))?;
+                    
+                    // Read interface file to extract function signatures
+                    let interface_content = fs::read_to_string(&interface_path)?;
+                    
+                    // Add to our list of interfaces to process
+                    api_interfaces.push((interface_name.to_string(), interface_content));
+                } else {
+                    println!("Interface file not found: {}", interface_path.display());
+                }
+            }
+        }
+    }
+    
+    // Now add the api crates to the workspace
+    update_workspace_cargo_toml(&cwd, &api_interfaces)?;
+    
+    // Generate implementation crates
+    for (interface_name, interface_content) in api_interfaces {
+        generate_api_crate(&cwd, &interface_name, &interface_content)?;
+    }
+    
+    println!("Implementation crates generated successfully.");
+    Ok(())
+}
+
+fn update_workspace_cargo_toml(cwd: &Path, api_interfaces: &[(String, String)]) -> Result<()> {
+    let cargo_toml_path = cwd.join("Cargo.toml");
+    println!("Updating workspace Cargo.toml at {}", cargo_toml_path.display());
+    
+    if !cargo_toml_path.exists() {
+        anyhow::bail!("Workspace Cargo.toml not found at {}", cargo_toml_path.display());
+    }
+    
+    let cargo_content = fs::read_to_string(&cargo_toml_path)?;
+    let mut cargo_toml: toml::Value = cargo_content.parse()?;
+    
+    // Get the current workspace members
+    if let Some(workspace) = cargo_toml.get_mut("workspace") {
+        if let Some(members) = workspace.get_mut("members") {
+            if let Some(members_array) = members.as_array_mut() {
+                let mut added_members = Vec::new();
+                
+                // Add each API interface crate if it's not already there
+                for (interface_name, _) in api_interfaces {
+                    let api_crate_name = format!("{}-api", interface_name);
+                    
+                    // Check if already in the members list
+                    if !members_array.iter().any(|m| m.as_str().map_or(false, |s| s == api_crate_name)) {
+                        println!("Adding {} to workspace members", api_crate_name);
+                        members_array.push(toml::Value::String(api_crate_name.clone()));
+                        added_members.push(api_crate_name);
+                    }
+                }
+                
+                // Sort the members array for consistency
+                members_array.sort_by(|a, b| {
+                    let a_str = a.as_str().unwrap_or("");
+                    let b_str = b.as_str().unwrap_or("");
+                    a_str.cmp(b_str)
+                });
+                
+                if !added_members.is_empty() {
+                    // Write the updated Cargo.toml
+                    let updated_content = toml::to_string_pretty(&cargo_toml)?;
+                    fs::write(&cargo_toml_path, updated_content)?;
+                    println!("Added {} new members to workspace: {:?}", added_members.len(), added_members);
+                } else {
+                    println!("No new members added to workspace");
+                }
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+fn generate_api_crate(cwd: &Path, interface_name: &str, interface_content: &str) -> Result<()> {
+    let api_crate_name = format!("{}-api", interface_name);
+    let api_crate_dir = cwd.join(&api_crate_name);
+    
+    println!("Generating API crate for {}", interface_name);
+    
+    // Create API crate directory
+    fs::create_dir_all(&api_crate_dir)?;
+    println!("Created directory: {}", api_crate_dir.display());
+    
+    // Create src directory
+    let src_dir = api_crate_dir.join("src");
+    fs::create_dir_all(&src_dir)?;
+    println!("Created src directory: {}", src_dir.display());
+    
+    // Create Cargo.toml
+    let cargo_toml_content = format!(r#"[package]
+name = "{}"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+anyhow = "1.0"
+hyperware_process_lib = {{ version = "1.0.2", features = ["logging"] }}
+process_macros = "0.1.0"
+futures-util = "0.3"
+serde = {{ version = "1.0", features = ["derive"] }}
+serde_json = "1.0"
+wit-bindgen = "0.36.0"
+once_cell = "1.20.2"
+futures = "0.3"
+uuid = {{ version = "1.0" }}
+
+[lib]
+crate-type = ["cdylib"]
+
+[package.metadata.component]
+package = "hyperware:process"
+"#, api_crate_name);
+    
+    let cargo_toml_path = api_crate_dir.join("Cargo.toml");
+    fs::write(&cargo_toml_path, cargo_toml_content)?;
+    println!("Created Cargo.toml: {}", cargo_toml_path.display());
+    
+    // Parse the interface content to extract function signatures and types
+    let functions = extract_functions_from_interface(interface_content)?;
+    
+    // Generate lib.rs with implementations
+    let lib_rs_content = generate_lib_rs_content(interface_name, &functions)?;
+    
+    let lib_rs_path = src_dir.join("lib.rs");
+    fs::write(&lib_rs_path, lib_rs_content)?;
+    println!("Created lib.rs: {}", lib_rs_path.display());
+    
+    println!("Successfully generated API crate: {}", api_crate_name);
+    Ok(())
+}
+
+fn extract_functions_from_interface(interface_content: &str) -> Result<Vec<WitFunction>> {
+    let mut functions = Vec::new();
+    
+    // Extract all lines containing function definitions
+    let mut current_attributes = Vec::new();
+    let lines: Vec<&str> = interface_content.lines().collect();
+    
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        
+        // Check for attribute comments
+        if trimmed.starts_with("//") {
+            current_attributes.push(trimmed.trim_start_matches("//").trim().to_string());
+            continue;
+        }
+        
+        // Check for function definitions
+        if trimmed.contains(": func(") && trimmed.contains(" -> ") {
+            println!("Found function definition: {}", trimmed);
+            
+            // Parse the function name
+            let name_end = trimmed.find(": func(").unwrap();
+            let name = trimmed[..name_end].trim().to_string();
+            
+            // Parse parameters
+            let params_start = trimmed.find('(').unwrap() + 1;
+            let params_end = trimmed.find(") ->").unwrap();
+            let params_str = &trimmed[params_start..params_end];
+            
+            // Parse return type
+            let return_start = trimmed.find("-> ").unwrap() + 3;
+            let return_end = if trimmed.contains(';') {
+                trimmed.find(';').unwrap()
+            } else {
+                trimmed.len()
+            };
+            let return_type = trimmed[return_start..return_end].trim().to_string();
+            
+            // Process parameters
+            let mut params = Vec::new();
+            if !params_str.is_empty() {
+                for param in params_str.split(',') {
+                    let param_parts: Vec<&str> = param.split(':').collect();
+                    if param_parts.len() == 2 {
+                        let param_name = param_parts[0].trim().to_string();
+                        let param_type = param_parts[1].trim().to_string();
+                        
+                        // Skip the "target: address" parameter as it's handled by the runtime
+                        if param_name != "target" || param_type != "address" {
+                            params.push((param_name, param_type));
+                        }
+                    }
+                }
+            }
+            
+            // Create function struct
+            let func_attrs = current_attributes.clone();
+            let wit_function = WitFunction {
+                name,
+                params,
+                return_type,
+                attributes: func_attrs,
+            };
+            
+            functions.push(wit_function.clone());
+            println!("Added function: {} with attributes: {:?}", wit_function.name, wit_function.attributes);
+            
+            // Clear attributes for next function
+            current_attributes.clear();
+        } else if !trimmed.is_empty() && !trimmed.starts_with("//") && 
+                  !trimmed.starts_with("use ") && !trimmed.starts_with("interface ") && 
+                  !trimmed.starts_with("record ") && !trimmed.starts_with("variant ") && 
+                  !trimmed.starts_with("}") {
+            // If not a function definition or a specific pattern we want to preserve attributes for,
+            // clear any accumulated attributes
+            current_attributes.clear();
+        }
+    }
+    
+    println!("Extracted {} functions", functions.len());
+    Ok(functions)
+}
+
+fn generate_lib_rs_content(interface_name: &str, functions: &[WitFunction]) -> Result<String> {
+    // Convert kebab-case to snake_case for the module name
+    let snake_interface_name = interface_name.replace('-', "_");
+    
+    // Generate the world name (interface_name-api-v0)
+    let world_name = format!("{}-api-v0", interface_name);
+    
+    // Start with the imports and wit-bindgen setup
+    let mut content = format!(r#"use crate::exports::hyperware::process::{}::Guest;
+use crate::exports::hyperware::process::{}::*;
+use crate::hyperware::process::standard::Address as WitAddress;
+
+wit_bindgen::generate!({{
+    path: "target/wit",
+    world: "{}",
+    generate_unused_types: true,
+    additional_derives: [serde::Deserialize, serde::Serialize, process_macros::SerdeJsonInto],
+}});
+
+struct Api;
+impl Guest for Api {{
+"#, snake_interface_name, snake_interface_name, world_name);
+    
+    // Add implementations for each function
+    for function in functions {
+        // Convert kebab-case function name to snake_case
+        let snake_func_name = function.name.replace('-', "_");
+        
+        // Generate parameter list
+        let mut param_list = Vec::new();
+        param_list.push("target: WitAddress".to_string());
+        
+        for (param_name, param_type) in &function.params {
+            // Convert kebab-case param name to snake_case
+            let snake_param_name = param_name.replace('-', "_");
+            
+            // Convert kebab-case type names to PascalCase
+            let rust_type = convert_wit_type_to_rust(param_type);
+            
+            param_list.push(format!("{}: {}", snake_param_name, rust_type));
+        }
+        
+        // Parse return type
+        let return_type = parse_wit_return_type(&function.return_type);
+        
+        // Generate function implementation
+        let default_return = generate_default_return_value(&return_type);
+        
+        content.push_str(&format!(r#"    fn {}({}) -> {} {{
+        {}{}
+    }}
+"#, 
+            snake_func_name, 
+            param_list.join(", "),
+            return_type,
+            // Add comment about implementation if there are attributes
+            if !function.attributes.is_empty() {
+                format!("        // {}\n        ", function.attributes.join(", "))
+            } else {
+                String::new()
+            },
+            default_return
+        ));
+    }
+    
+    // Add closing brace and export macro
+    content.push_str("}\nexport!(Api);\n");
+    
+    Ok(content)
+}
+
+// Helper to generate default return values
+fn generate_default_return_value(return_type: &str) -> String {
+    if return_type.starts_with("Result<") {
+        if return_type.contains("Result<(), ") {
+            "Ok(())".to_string()
+        } else if return_type.contains("Result<String, ") {
+            "Ok(\"Success\".to_string())".to_string()
+        } else if return_type.contains("Result<f32, ") || return_type.contains("Result<f64, ") {
+            "Ok(0.0)".to_string()
+        } else if return_type.contains("Result<i32, ") || return_type.contains("Result<u32, ") ||
+                 return_type.contains("Result<i64, ") || return_type.contains("Result<u64, ") ||
+                 return_type.contains("Result<s32, ") || return_type.contains("Result<s64, ") {
+            "Ok(0)".to_string()
+        } else if return_type.contains("Result<bool, ") {
+            "Ok(true)".to_string()
+        } else if return_type.contains("Result<Vec<") || return_type.contains("Result<List<") {
+            "Ok(Vec::new())".to_string()
+        } else if return_type.contains("Result<Option<") {
+            "Ok(None)".to_string()
+        } else {
+            // For custom types in Result
+            "Ok(Default::default())".to_string()
+        }
+    } else {
+        // Direct return types
+        match return_type {
+            "()" => "()".to_string(),
+            "String" | "string" => "\"Success\".to_string()".to_string(),
+            "f32" | "f64" => "0.0".to_string(),
+            "i32" | "u32" | "i64" | "u64" | "s32" | "s64" => "0".to_string(),
+            "bool" => "true".to_string(),
+            _ => {
+                if return_type.starts_with("Vec<") || return_type.starts_with("List<") {
+                    "Vec::new()".to_string()
+                } else if return_type.starts_with("Option<") {
+                    "None".to_string()
+                } else {
+                    "Default::default()".to_string()
+                }
+            }
+        }
+    }
+}
+
+// Parse WIT return type into Rust return type
+fn parse_wit_return_type(wit_type: &str) -> String {
+    if wit_type.starts_with("result<") {
+        let inner = wit_type.trim_start_matches("result<").trim_end_matches(">");
+        
+        // Split by comma to get Ok and Err types
+        let parts: Vec<&str> = inner.split(',').collect();
+        
+        if parts.len() == 2 {
+            let ok_type = parts[0].trim();
+            let err_type = parts[1].trim();
+            
+            // Convert WIT types to Rust types
+            let ok_rust_type = convert_wit_type_to_rust(ok_type);
+            let err_rust_type = convert_wit_type_to_rust(err_type);
+            
+            format!("Result<{}, {}>", ok_rust_type, err_rust_type)
+        } else {
+            // Fallback
+            "Result<(), String>".to_string()
+        }
+    } else {
+        // Direct mapping for non-result types
+        convert_wit_type_to_rust(wit_type)
+    }
+}
+
+// Convert WIT type to Rust type
+fn convert_wit_type_to_rust(wit_type: &str) -> String {
+    match wit_type.trim() {
+        "unit" => "()".to_string(),
+        "string" => "String".to_string(),
+        "s32" => "i32".to_string(),
+        "u32" => "u32".to_string(),
+        "s64" => "i64".to_string(),
+        "u64" => "u64".to_string(),
+        "f32" => "f32".to_string(),
+        "f64" => "f64".to_string(),
+        "bool" => "bool".to_string(),
+        _ => {
+            // Check if it's a list type
+            if wit_type.starts_with("list<") && wit_type.ends_with(">") {
+                let inner_type = &wit_type[5..wit_type.len()-1];
+                let rust_inner_type = convert_wit_type_to_rust(inner_type);
+                format!("Vec<{}>", rust_inner_type)
+            } 
+            // Check if it's an option type
+            else if wit_type.starts_with("option<") && wit_type.ends_with(">") {
+                let inner_type = &wit_type[7..wit_type.len()-1];
+                let rust_inner_type = convert_wit_type_to_rust(inner_type);
+                format!("Option<{}>", rust_inner_type)
+            }
+            // Check if it's a tuple type
+            else if wit_type.starts_with("tuple<") && wit_type.ends_with(">") {
+                let inner_types = &wit_type[6..wit_type.len()-1];
+                let rust_inner_types: Vec<String> = inner_types
+                    .split(',')
+                    .map(|t| convert_wit_type_to_rust(t.trim()))
+                    .collect();
+                format!("({})", rust_inner_types.join(", "))
+            }
+            // For custom types, use PascalCase
+            else {
+                to_pascal_case(&wit_type.replace('-', "_"))
+            }
+        }
+    }
+}
+
+// Helper to convert a kebab-case or snake_case string to PascalCase
+fn to_pascal_case(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut capitalize_next = true;
+    
+    for c in s.chars() {
+        if c == '_' || c == '-' {
+            capitalize_next = true;
+        } else if capitalize_next {
+            result.push(c.to_uppercase().next().unwrap());
+            capitalize_next = false;
+        } else {
+            result.push(c);
+        }
+    }
+    
+    result
 }
