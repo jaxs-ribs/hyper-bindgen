@@ -466,7 +466,7 @@ fn generate_interface_wit_content(
 }
 
 // Process a single Rust project and generate WIT files
-fn process_rust_project(project_path: &Path, api_dir: &Path) -> Result<Option<String>> {
+fn process_rust_project(project_path: &Path, api_dir: &Path) -> Result<Option<(String, String)>> {
     println!("\nProcessing project: {}", project_path.display());
     let lib_rs = project_path.join("src").join("lib.rs");
     
@@ -536,18 +536,29 @@ fn process_rust_project(project_path: &Path, api_dir: &Path) -> Result<Option<St
                         if let (Some(ref iface_name), Some(ref kebab_name)) = (&interface_name, &kebab_interface_name) {
                             // We already validated the interface name, so the file name should be fine
                             
-                            // Generate the WIT content
+                            // Generate the WIT content for the interface
                             let content = generate_interface_wit_content(impl_item, iface_name, &ast)?;
                             
                             if !content.is_empty() {
                                 // Write the interface file with kebab-case name
                                 let interface_file = api_dir.join(format!("{}.wit", kebab_name));
-                                println!("Writing WIT file to {}", interface_file.display());
+                                println!("Writing interface WIT file to {}", interface_file.display());
                                 
                                 fs::write(&interface_file, &content)
                                     .with_context(|| format!("Failed to write {}", interface_file.display()))?;
                                 
-                                println!("Successfully wrote WIT file");
+                                println!("Successfully wrote interface WIT file");
+                                
+                                // Create and write the individual world file
+                                let world_name = format!("{}-api-v0", kebab_name);
+                                let world_content = format!("world {} {{\n    export {};\n}}\n", world_name, kebab_name);
+                                let world_file = api_dir.join(format!("{}.wit", world_name));
+                                
+                                println!("Writing individual world WIT file to {}", world_file.display());
+                                fs::write(&world_file, &world_content)
+                                    .with_context(|| format!("Failed to write {}", world_file.display()))?;
+                                
+                                println!("Successfully wrote individual world WIT file");
                             } else {
                                 println!("Generated WIT content is empty, skipping file creation");
                             }
@@ -559,10 +570,11 @@ fn process_rust_project(project_path: &Path, api_dir: &Path) -> Result<Option<St
         }
     }
     
-    if let (Some(_), Some(_), Some(kebab_iface)) = (wit_world, interface_name, kebab_interface_name) {
-        println!("Returning export statement for interface {}", kebab_iface);
-        // Use kebab-case interface name for export (changed from import to export)
-        Ok(Some(format!("    export {};", kebab_iface)))
+    if let (Some(_main_world), Some(_), Some(kebab_iface)) = (wit_world, interface_name, kebab_interface_name) {
+        println!("Returning import statement for interface {}", kebab_iface);
+        // Return the kebab interface name and its corresponding individual world name
+        let world_name = format!("{}-api-v0", kebab_iface);
+        Ok(Some((kebab_iface, world_name)))
     } else {
         println!("No valid interface found");
         Ok(None)
@@ -583,7 +595,7 @@ impl AsTypePath for syn::Type {
     }
 }
 
-fn main() -> Result<()> {
+fn generate_wit_files() -> Result<()> {
     // Get the current working directory
     let cwd = std::env::current_dir()?;
     println!("Current working directory: {}", cwd.display());
@@ -605,102 +617,73 @@ fn main() -> Result<()> {
     
     println!("Found {} relevant Rust projects.", projects.len());
     
-    // Process each project and collect world exports
-    let mut world_exports = Vec::new();
-    let mut world_names = HashSet::new();
+    // Process each project and collect world imports
+    let mut world_imports = Vec::new();
+    let mut main_world_name = None;
     
     for project_path in projects {
         println!("Processing project: {}", project_path.display());
         
         match process_rust_project(&project_path, &api_dir) {
-            Ok(Some(export)) => {
-                println!("Got export statement: {}", export);
-                world_exports.push(export);
+            Ok(Some((interface_name, world_name))) => {
+                println!("Got interface: {} and its world: {}", interface_name, world_name);
+                // Import the individual world in the main world
+                world_imports.push(format!("    import {};", world_name));
+                
+                // Extract the main world name from the first project (they should all use the same)
+                if main_world_name.is_none() {
+                    // Extract the main world from project
+                    let lib_rs = project_path.join("src").join("lib.rs");
+                    if let Ok(content) = fs::read_to_string(&lib_rs) {
+                        if let Ok(ast) = syn::parse_file(&content) {
+                            for item in &ast.items {
+                                if let Item::Impl(impl_item) = item {
+                                    if let Some(attr) = impl_item.attrs.iter().find(|attr| attr.path().is_ident("hyperprocess")) {
+                                        if let Ok(world_name) = extract_wit_world(&[attr.clone()]) {
+                                            main_world_name = Some(world_name);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             },
-            Ok(None) => println!("No export statement generated"),
+            Ok(None) => println!("No import statement generated"),
             Err(e) => println!("Error processing project: {}", e),
         }
     }
     
-    println!("Collected {} world exports", world_exports.len());
+    println!("Collected {} world imports", world_imports.len());
     
-    // Check for existing world definition files and update them
-    println!("Looking for existing world definition files");
-    for entry in WalkDir::new(&api_dir)
-        .max_depth(1)
-        .into_iter()
-        .filter_map(Result::ok)
-    {
-        let path = entry.path();
+    // Generate the main world file if we have imports
+    if !world_imports.is_empty() {
+        // Use default name if not found in any project
+        let main_world = main_world_name.unwrap_or_else(|| "async-app-template-dot-os-v0".to_string());
+        println!("Using main world name: {}", main_world);
         
-        if path.is_file() && path.extension().map_or(false, |ext| ext == "wit") {
-            println!("Checking WIT file: {}", path.display());
-            
-            if let Ok(content) = fs::read_to_string(path) {
-                if content.contains("world ") {
-                    println!("Found world definition file");
-                    
-                    // Extract the world name
-                    let lines: Vec<&str> = content.lines().collect();
-                    
-                    if let Some(world_line) = lines.iter().find(|line| line.trim().starts_with("world ")) {
-                        println!("World line: {}", world_line);
-                        
-                        if let Some(world_name) = world_line.trim().split_whitespace().nth(1) {
-                            let clean_name = world_name.trim_end_matches(" {");
-                            println!("Extracted world name: {}", clean_name);
-                            
-                            // We don't need to validate world names for digits
-                            
-                            world_names.insert(clean_name.to_string());
-                            
-                            // Create updated world content - use export instead of import
-                            let world_content = format!(
-                                "world {} {{\n{}\n    include process-v1;\n}}",
-                                clean_name,
-                                world_exports.join("\n") // No comma separator because each export has a semicolon
-                            );
-                            
-                            println!("Writing updated world definition to {}", path.display());
-                            // Write the updated world file
-                            fs::write(path, world_content)
-                                .with_context(|| format!("Failed to write updated world file: {}", path.display()))?;
-                            
-                            println!("Successfully updated world definition");
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    // If no world definitions were found, create a default one
-    if world_names.is_empty() && !world_exports.is_empty() {
-        // Define default world name
-        let default_world = "async-app-template-dot-os-v0";
-        println!("No existing world definitions found, creating default with name: {}", default_world);
-        
-        // We don't need to validate world names for digits
-        
-        // Create world content with process-v1 include, using export instead of import
+        // Create main world content
         let world_content = format!(
             "world {} {{\n{}\n    include process-v1;\n}}",
-            default_world,
-            world_exports.join("\n") // No comma separator because each export has a semicolon
+            main_world,
+            world_imports.join("\n") 
         );
         
-        let world_file = api_dir.join(format!("{}.wit", default_world));
-        println!("Writing default world definition to {}", world_file.display());
+        let world_file = api_dir.join(format!("{}.wit", main_world));
+        println!("Writing main world definition to {}", world_file.display());
         
         fs::write(&world_file, world_content)
-            .with_context(|| format!("Failed to write default world file: {}", world_file.display()))?;
+            .with_context(|| format!("Failed to write main world file: {}", world_file.display()))?;
         
-        println!("Successfully created default world definition");
+        println!("Successfully created main world definition");
     }
     
     println!("WIT files generated successfully in the 'api' directory.");
     Ok(())
+
 }
+
 
 // Find all relevant Rust projects
 fn find_rust_projects(base_dir: &Path) -> Vec<PathBuf> {
@@ -748,4 +731,15 @@ fn find_rust_projects(base_dir: &Path) -> Vec<PathBuf> {
     
     println!("Found {} relevant Rust projects", projects.len());
     projects
+}
+
+fn main() -> Result<()> {
+    generate_wit_files()?;
+    generate_wit_implementations()?;
+    Ok(())
+}
+
+fn generate_wit_implementations() -> Result<()> {
+    // TODO: Implement this, and only write below, not above. 
+    Ok(())
 }
