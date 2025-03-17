@@ -11,6 +11,8 @@ anyhow = "1.0"
 syn = { version = "2.0", features = ["full", "parsing", "extra-traits"] }
 walkdir = "2.3"
 toml = "0.7"
+clap = { version = "4.4", features = ["derive"] }
+
 
 [[bin]]
 name = "hyper-bindgen"
