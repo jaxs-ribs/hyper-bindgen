@@ -32,7 +32,9 @@ fn find_world_name(api_dir: &Path) -> Result<String> {
     
     // If no world name is found, we should fail
     bail!("No world name found in any WIT file. Cannot generate caller-utils without a world name.")
-}use anyhow::{Context, Result, bail};
+}
+
+use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -264,11 +266,15 @@ fn generate_async_function(signature: &SignatureStruct) -> String {
     // Convert function name from kebab-case to snake_case
     let snake_function_name = to_snake_case(&signature.function_name);
     
+    // Get pascal case version for the JSON request format
+    let pascal_function_name = to_pascal_case(&signature.function_name);
+    
     // Function full name with attribute type
     let full_function_name = format!("{}_{}_rpc", snake_function_name, signature.attr_type);
     
     // Extract parameters and return type
     let mut params = Vec::new();
+    let mut param_names = Vec::new();
     let mut return_type = "()".to_string();
     let mut target_param = "";
     
@@ -277,15 +283,17 @@ fn generate_async_function(signature: &SignatureStruct) -> String {
         let rust_type = wit_type_to_rust(&field.wit_type);
         
         if field.name == "target" {
-            target_param = if field.wit_type == "string" {
-                "&str"
+            if field.wit_type == "string" {
+                target_param = "&str";
             } else {
-                "&WitAddress"
-            };
+                // Use hyperware_process_lib::Address instead of WitAddress
+                target_param = "&Address";
+            }
         } else if field.name == "returning" {
             return_type = rust_type;
         } else {
             params.push(format!("{}: {}", field_name_snake, rust_type));
+            param_names.push(field_name_snake);
         }
     }
     
@@ -296,17 +304,81 @@ fn generate_async_function(signature: &SignatureStruct) -> String {
         format!("target: {}{}", target_param, if params.is_empty() { "" } else { ", " }) + &params.join(", ")
     };
     
-    // Generate function with proper default return value
-    let default_value = generate_default_value(&return_type);
+    // Wrap the return type in SendResult
+    let wrapped_return_type = format!("SendResult<{}>", return_type);
     
+    // For HTTP endpoints, just return a default implementation for now
+    if signature.attr_type == "http" {
+        let default_value = generate_default_value(&return_type);
+        
+        // Add underscore prefix to all parameters for HTTP stubs
+        let all_params_with_underscore = if target_param.is_empty() {
+            params.iter()
+                .map(|param| {
+                    let parts: Vec<&str> = param.split(':').collect();
+                    if parts.len() == 2 {
+                        format!("_{}: {}", parts[0], parts[1])
+                    } else {
+                        format!("_{}", param)
+                    }
+                })
+                .collect::<Vec<String>>()
+                .join(", ")
+        } else {
+            let target_with_underscore = format!("_target: {}", target_param);
+            if params.is_empty() {
+                target_with_underscore
+            } else {
+                let params_with_underscore = params.iter()
+                    .map(|param| {
+                        let parts: Vec<&str> = param.split(':').collect();
+                        if parts.len() == 2 {
+                            format!("_{}: {}", parts[0], parts[1])
+                        } else {
+                            format!("_{}", param)
+                        }
+                    })
+                    .collect::<Vec<String>>()
+                    .join(", ");
+                format!("{}, {}", target_with_underscore, params_with_underscore)
+            }
+        };
+        
+        return format!(
+            "/// Generated stub for `{}` {} RPC call\npub async fn {}({}) -> {} {{\n    // TODO: Implement HTTP endpoint\n    SendResult::Success({})\n}}",
+            signature.function_name,
+            signature.attr_type,
+            full_function_name,
+            all_params_with_underscore,
+            wrapped_return_type,
+            default_value
+        );
+    }
+    
+    // Format JSON parameters correctly
+    let json_params = if param_names.is_empty() {
+        // No parameters case
+        format!("json!({{\"{}\": {{}}}}", pascal_function_name)
+    } else if param_names.len() == 1 {
+        // Single parameter case
+        format!("json!({{\"{}\": {}}})", pascal_function_name, param_names[0])
+    } else {
+        // Multiple parameters case - use tuple format
+        format!("json!({{\"{}\": ({})}})", 
+                pascal_function_name, 
+                param_names.join(", "))
+    };
+    
+    // Generate function with implementation using send
     format!(
-        "/// Generated stub for `{}` {} RPC call\n/// This function provides a placeholder implementation that returns default values\npub async fn {}({}) -> {} {{\n    // TODO: Implement actual RPC call\n    {}\n}}",
+        "/// Generated stub for `{}` {} RPC call\npub async fn {}({}) -> {} {{\n    let request = {};\n    send::<{}>(&request, target, 30).await\n}}",
         signature.function_name,
         signature.attr_type,
         full_function_name,
         all_params,
-        return_type,
-        default_value
+        wrapped_return_type,
+        json_params,
+        return_type
     )
 }
 
@@ -328,9 +400,6 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
-[package.metadata.component]
-package = "hyperware:process"
-
 [dependencies]
 anyhow = "1.0"
 hyperware_process_lib = { version = "1.0.2", features = ["logging"] }
@@ -338,7 +407,7 @@ process_macros = "0.1.0"
 futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-wit-bindgen = "0.36.0"
+wit_parser = { path = "../crates/wit_parser" }
 once_cell = "1.20.2"
 hyperware_app_common = { path = "../crates/hyperware_app_common" }
 futures = "0.3"
@@ -346,7 +415,7 @@ uuid = { version = "1.0" }
 
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "lib"]
 "#;
     
     fs::write(caller_utils_dir.join("Cargo.toml"), cargo_toml)
@@ -428,13 +497,12 @@ crate-type = ["cdylib"]
     // Create specific import statements for each interface's types
     let mut interface_use_statements = Vec::new();
     for interface_name in &interface_imports {
-        let snake_interface_name = to_snake_case(interface_name);
         if let Some(types) = interface_types.get(interface_name) {
             // Create specific imports for each type
             for type_name in types {
                 let pascal_type = to_pascal_case(type_name);
                 interface_use_statements.push(
-                    format!("pub use crate::hyperware::process::{}::{};", snake_interface_name, pascal_type)
+                    format!("pub use crate::wit_custom::{};", pascal_type)
                 );
             }
         }
@@ -443,25 +511,18 @@ crate-type = ["cdylib"]
     // Create single lib.rs with all modules inline
     let mut lib_rs = String::new();
     
-    // First add the wit_bindgen generate macro with the correct world name
-    lib_rs.push_str(&format!(r#"wit_bindgen::generate!({{
-    path: "target/wit",
-    world: "{}",
-    generate_unused_types: true,
-    additional_derives: [serde::Deserialize, serde::Serialize, process_macros::SerdeJsonInto],
-}});
-struct Component;
-impl Guest for Component {{
-    fn init(_our: String) {{}}
-}}
-export!(Component);
-
-"#, world_name));
+    // First add the wit_parser macro with the correct world name
+    lib_rs.push_str(&format!("use wit_parser::wit_parser;\n"));
+    lib_rs.push_str(&format!("wit_parser!(\"api/{}.wit\");\n\n", world_name));
     
     lib_rs.push_str("/// Generated caller utilities for RPC function stubs\n\n");
     
     // Add global imports
-    lib_rs.push_str("pub use hyperware::process::standard::Address as WitAddress;\n\n");
+    lib_rs.push_str("pub use hyperware_app_common::SendResult;\n");
+    lib_rs.push_str("pub use hyperware_app_common::send;\n");
+    lib_rs.push_str("use hyperware_process_lib::Address;\n");
+    lib_rs.push_str("use serde_json::json;\n\n");
+
     
     // Add interface use statements
     if !interface_use_statements.is_empty() {
