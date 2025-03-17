@@ -1,5 +1,5 @@
 [package]
-name = "bababooey"
+name = "hyper-bindgen"
 version = "0.1.0"
 edition = "2021"
 authors = ["Your Name <your.email@example.com>"]
@@ -13,5 +13,5 @@ walkdir = "2.3"
 toml = "0.7"
 
 [[bin]]
-name = "bababooey"
+name = "hyper-bindgen"
 path = "src/main.rs"

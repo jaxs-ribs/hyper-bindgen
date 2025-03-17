@@ -9,16 +9,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dcfed56ad506cb2c684a14971b8861fdc3baaaae314b9e5f9bb532cbe3ba7a4f"
 
 [[package]]
-name = "bababooey"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "syn",
- "toml",
- "walkdir",
-]
-
-[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -29,6 +19,16 @@ name = "hashbrown"
 version = "0.15.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf151400ff0baff5465007dd2f3e717f3fe502074ca563069ce3a6629d07b289"
+
+[[package]]
+name = "hyper-bindgen"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "syn",
+ "toml",
+ "walkdir",
+]
 
 [[package]]
 name = "indexmap"

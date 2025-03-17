@@ -1,10 +1,10 @@
-# Bababooey
+# hyper-bindgen
 
 A tool to generate WIT (WebAssembly Interface Type) files from Rust hyperprocess implementations.
 
 ## Overview
 
-Bababooey analyzes Rust code that uses the hyperprocess attribute and automatically generates corresponding WIT interface definitions. This simplifies the development workflow when working with WebAssembly components that use the WIT format.
+hyper-bindgen analyzes Rust code that uses the hyperprocess attribute and automatically generates corresponding WIT interface definitions. This simplifies the development workflow when working with WebAssembly components that use the WIT format.
 
 ## Features
 
@@ -25,7 +25,7 @@ cargo install --path .
 
 ```bash
 # Run in the root directory of your Rust project
-bababooey
+hyper-bindgen
 
 # The tool will:
 # 1. Find all Rust files with hyperprocess implementations
@@ -45,7 +45,7 @@ impl MyService {
 }
 ```
 
-Bababooey will generate a WIT file like:
+hyper-bindgen will generate a WIT file like:
 
 ```wit
 interface my-service {
