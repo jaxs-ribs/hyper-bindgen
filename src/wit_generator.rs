@@ -397,11 +397,205 @@ fn generate_signature_struct(
     Ok(record_def)
 }
 
-// Generate WIT content for an interface
-fn generate_interface_wit_content(
+// Simple, robust function to collect types from all Rust files in a crate
+fn collect_all_crate_types(src_dir: &Path) -> Result<HashMap<String, String>> {
+    let mut all_type_defs = HashMap::new();
+    
+    println!("\n===== SCANNING ALL CRATE FILES FOR TYPE DEFINITIONS =====");
+    println!("Scanning directory: {}", src_dir.display());
+    
+    // Track statistics
+    let mut files_processed = 0;
+    let mut files_with_types = 0;
+    
+    // Simply walk through ALL Rust files in the crate directory and its subdirectories
+    for entry in WalkDir::new(src_dir)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().map_or(false, |ext| ext == "rs"))
+    {
+        let file_path = entry.path();
+        files_processed += 1;
+        
+        println!("Processing file: {}", file_path.display());
+        
+        // Try to read and parse the file
+        match fs::read_to_string(file_path) {
+            Ok(content) => {
+                // Skip empty files
+                if content.trim().is_empty() {
+                    continue;
+                }
+                
+                match syn::parse_file(&content) {
+                    Ok(ast) => {
+                        // Extract type definitions from this file
+                        match collect_type_definitions(&ast) {
+                            Ok(file_types) => {
+                                if !file_types.is_empty() {
+                                    files_with_types += 1;
+                                    
+                                    println!("  Found {} type definitions in {}", 
+                                             file_types.len(), file_path.file_name().unwrap_or_default().to_string_lossy());
+                                    
+                                    for (type_name, _) in &file_types {
+                                        println!("    - {}", type_name);
+                                    }
+                                    
+                                    // Add these types to our collection
+                                    all_type_defs.extend(file_types);
+                                }
+                            },
+                            Err(e) => println!("  Error collecting types from {}: {}", 
+                                              file_path.display(), e),
+                        }
+                    },
+                    Err(e) => println!("  Error parsing {}: {}", file_path.display(), e),
+                }
+            },
+            Err(e) => println!("  Error reading {}: {}", file_path.display(), e),
+        }
+
+    }
+    
+    println!("\n===== SCAN SUMMARY =====");
+    println!("  Processed {} Rust files", files_processed);
+    println!("  Found types in {} files", files_with_types);
+    println!("  Total types collected: {}", all_type_defs.len());
+    
+    if !all_type_defs.is_empty() {
+        println!("\nTypes found in crate:");
+        for name in all_type_defs.keys() {
+            println!("  - {}", name);
+        }
+    } else {
+        println!("\nWARNING: No type definitions found in any crate files!");
+    }
+    
+    Ok(all_type_defs)
+}
+
+// Process a single Rust project and generate WIT files
+fn process_rust_project(project_path: &Path, api_dir: &Path) -> Result<Option<String>> {
+    println!("\nProcessing project: {}", project_path.display());
+    let lib_rs = project_path.join("src").join("lib.rs");
+    
+    println!("Looking for lib.rs at {}", lib_rs.display());
+    if !lib_rs.exists() {
+        println!("No lib.rs found for project: {}", project_path.display());
+        return Ok(None);
+    }
+    
+    // First, collect ALL type definitions from ALL Rust files in the crate
+    let src_dir = project_path.join("src");
+    let all_type_defs = collect_all_crate_types(&src_dir)?;
+    println!("Collected {} type definitions from the entire crate", all_type_defs.len());
+    
+    // Now read and parse lib.rs to find the interface definition
+    let lib_content = fs::read_to_string(&lib_rs)
+        .with_context(|| format!("Failed to read lib.rs for project: {}", project_path.display()))?;
+    
+    println!("Successfully read lib.rs, parsing...");
+    let ast = syn::parse_file(&lib_content)
+        .with_context(|| format!("Failed to parse lib.rs for project: {}", project_path.display()))?;
+    
+    println!("Successfully parsed lib.rs");
+    
+    let mut wit_world = None;
+    let mut interface_name: Option<String> = None;  // Fix: Use String instead of str
+    let mut kebab_interface_name: Option<String> = None; // Fix: Use String instead of str
+    
+    println!("Scanning for impl blocks with hyperprocess attribute");
+    for item in &ast.items {
+        if let Item::Impl(impl_item) = item {
+            println!("Found impl block");
+            
+            // Check if this impl block has a #[hyperprocess] attribute
+            if let Some(attr) = impl_item.attrs.iter().find(|attr| attr.path().is_ident("hyperprocess")) {
+                println!("Found hyperprocess attribute");
+                
+                // Extract the wit_world name
+                match extract_wit_world(&[attr.clone()]) {
+                    Ok(world_name) => {
+                        println!("Extracted wit_world: {}", world_name);
+                        wit_world = Some(world_name);
+                        
+                        // Get the interface name from the impl type
+                        // Fix: Extract the type name correctly without using the AsTypePath trait
+                        if let syn::Type::Path(type_path) = &*impl_item.self_ty {
+                            if let Some(last_segment) = type_path.path.segments.last() {
+                                let name = last_segment.ident.to_string();
+                                interface_name = Some(name);
+                            }
+                        }
+                        
+                        // Check for "State" suffix and remove it
+                        if let Some(ref name) = interface_name {
+                            // Validate the interface name
+                            match validate_name(name, "Interface") {
+                                Ok(_) => {
+                                    // Remove State suffix if present
+                                    let base_name = remove_state_suffix(name);
+                                    
+                                    // Convert to kebab-case for file name and interface name
+                                    kebab_interface_name = Some(to_kebab_case(&base_name));
+                                    
+                                    println!("Interface name: {:?}", interface_name);
+                                    println!("Base name: {}", base_name);
+                                    println!("Kebab interface name: {:?}", kebab_interface_name);
+                                },
+                                Err(e) => {
+                                    println!("Interface name validation error: {}", e);
+                                    continue;
+                                }
+                            }
+                        }
+                        
+                        if let (Some(ref iface_name), Some(ref kebab_name)) = (&interface_name, &kebab_interface_name) {
+                            // We already validated the interface name, so the file name should be fine
+                            
+                            // Generate the WIT content, passing the all_type_defs
+                            match generate_interface_wit_content_with_types(impl_item, iface_name, &ast, &all_type_defs) {
+                                Ok(content) => {
+                                    if !content.is_empty() {
+                                        // Write the interface file with kebab-case name
+                                        let interface_file = api_dir.join(format!("{}.wit", kebab_name));
+                                        println!("Writing WIT file to {}", interface_file.display());
+                                        
+                                        fs::write(&interface_file, &content)
+                                            .with_context(|| format!("Failed to write {}", interface_file.display()))?;
+                                        
+                                        println!("Successfully wrote WIT file");
+                                    } else {
+                                        println!("Generated WIT content is empty, skipping file creation");
+                                    }
+                                },
+                                Err(e) => println!("Error generating WIT content: {}", e),
+                            }
+                        }
+                    },
+                    Err(e) => println!("Failed to extract wit_world: {}", e),
+                }
+            }
+        }
+    }
+    
+    if let (Some(_), Some(_), Some(ref kebab_iface)) = (wit_world, interface_name, kebab_interface_name) {
+        println!("Returning import statement for interface {}", kebab_iface);
+        // Use kebab-case interface name for import
+        Ok(Some(format!("    import {};", kebab_iface)))
+    } else {
+        println!("No valid interface found");
+        Ok(None)
+    }
+}
+
+// Modified version of generate_interface_wit_content that accepts external type definitions
+fn generate_interface_wit_content_with_types(
     impl_item: &syn::ItemImpl,
     interface_name: &str,
     ast: &syn::File,
+    all_type_defs: &HashMap<String, String>,
 ) -> Result<String> {
     let mut signature_structs = Vec::new();
     let mut used_types = HashSet::new();
@@ -413,8 +607,7 @@ fn generate_interface_wit_content(
     let kebab_interface_name = to_kebab_case(&base_name);
     println!("Generating WIT content for interface: {} (kebab: {})", interface_name, kebab_interface_name);
     
-    // We'll use a simpler comment approach now, added directly in the content generation code
-    
+    // Process methods and collect signature structs
     for item in &impl_item.items {
         if let ImplItem::Fn(method) = item {
             let method_name = method.sig.ident.to_string();
@@ -463,40 +656,21 @@ fn generate_interface_wit_content(
         }
     }
     
-    // Collect all type definitions from the file
-    let all_type_defs = collect_type_definitions(ast)?;
+    // Also collect types from the current file for completeness
+    let current_file_types = collect_type_definitions(ast)?;
     
-    // Filter for only the types we're using
-    let mut type_defs = Vec::new();
-    let mut processed_types = HashSet::new();
-    let mut types_to_process: Vec<String> = used_types.into_iter().collect();
+    // Create a merged map of all type definitions with preference to current file
+    let mut merged_type_defs = all_type_defs.clone();
+    merged_type_defs.extend(current_file_types);
     
-    println!("Processing used types: {:?}", types_to_process);
+    // CHANGE: Include ALL types from the crate, not just referenced ones
+    println!("Including all {} types from the crate in the WIT file", merged_type_defs.len());
     
-    // Process all referenced types and their dependencies
-    while let Some(type_name) = types_to_process.pop() {
-        if processed_types.contains(&type_name) {
-            continue;
-        }
-        
-        processed_types.insert(type_name.clone());
-        println!("  Processing type: {}", type_name);
-        
-        if let Some(type_def) = all_type_defs.get(&type_name) {
-            println!("    Found type definition");
-            type_defs.push(type_def.clone());
-            
-            // Extract any types referenced in this type definition
-            for referenced_type in all_type_defs.keys() {
-                if type_def.contains(referenced_type) && !processed_types.contains(referenced_type) {
-                    println!("    Adding referenced type: {}", referenced_type);
-                    types_to_process.push(referenced_type.clone());
-                }
-            }
-        } else {
-            println!("    No definition found for type: {}", type_name);
-        }
-    }
+    // Convert all type definitions to a vector
+    let mut type_defs: Vec<String> = merged_type_defs.values().cloned().collect();
+    
+    // Sort type definitions for stable output
+    type_defs.sort();
     
     // Generate the final WIT content
     if signature_structs.is_empty() {
@@ -509,7 +683,7 @@ fn generate_interface_wit_content(
         // Add standard imports
         content.push_str("\n    use standard.{address};\n\n");
         
-        // Add type definitions if any
+        // Add ALL type definitions
         if !type_defs.is_empty() {
             content.push_str(&type_defs.join("\n\n"));
             content.push_str("\n\n");
@@ -520,126 +694,9 @@ fn generate_interface_wit_content(
         
         // Wrap in interface block
         let final_content = format!("interface {} {{\n{}\n}}\n", kebab_interface_name, content);
-        println!("Generated interface content for {} with {} signature structs", interface_name, signature_structs.len());
+        println!("Generated interface content for {} with {} signature structs and {} type definitions", 
+                interface_name, signature_structs.len(), type_defs.len());
         Ok(final_content)
-    }
-}
-
-// Helper trait to get TypePath from Type
-trait AsTypePath {
-    fn as_type_path(&self) -> Option<&syn::TypePath>;
-}
-
-impl AsTypePath for syn::Type {
-    fn as_type_path(&self) -> Option<&syn::TypePath> {
-        match self {
-            syn::Type::Path(tp) => Some(tp),
-            _ => None,
-        }
-    }
-}
-
-// Process a single Rust project and generate WIT files
-fn process_rust_project(project_path: &Path, api_dir: &Path) -> Result<Option<String>> {
-    println!("\nProcessing project: {}", project_path.display());
-    let lib_rs = project_path.join("src").join("lib.rs");
-    
-    println!("Looking for lib.rs at {}", lib_rs.display());
-    if !lib_rs.exists() {
-        println!("No lib.rs found for project: {}", project_path.display());
-        return Ok(None);
-    }
-    
-    let lib_content = fs::read_to_string(&lib_rs)
-        .with_context(|| format!("Failed to read lib.rs for project: {}", project_path.display()))?;
-    
-    println!("Successfully read lib.rs, parsing...");
-    let ast = syn::parse_file(&lib_content)
-        .with_context(|| format!("Failed to parse lib.rs for project: {}", project_path.display()))?;
-    
-    println!("Successfully parsed lib.rs");
-    
-    let mut wit_world = None;
-    let mut interface_name = None;
-    let mut kebab_interface_name = None;
-    
-    println!("Scanning for impl blocks with hyperprocess attribute");
-    for item in &ast.items {
-        if let Item::Impl(impl_item) = item {
-            println!("Found impl block");
-            
-            // Check if this impl block has a #[hyperprocess] attribute
-            if let Some(attr) = impl_item.attrs.iter().find(|attr| attr.path().is_ident("hyperprocess")) {
-                println!("Found hyperprocess attribute");
-                
-                // Extract the wit_world name
-                match extract_wit_world(&[attr.clone()]) {
-                    Ok(world_name) => {
-                        println!("Extracted wit_world: {}", world_name);
-                        wit_world = Some(world_name);
-                        
-                        // Get the interface name from the impl type
-                        interface_name = impl_item
-                            .self_ty
-                            .as_ref()
-                            .as_type_path()
-                            .map(|tp| {
-                                if let Some(last_segment) = tp.path.segments.last() {
-                                    last_segment.ident.to_string()
-                                } else {
-                                    "Unknown".to_string()
-                                }
-                            });
-                        
-                        // Check for "State" suffix and remove it
-                        if let Some(ref name) = interface_name {
-                            // Validate the interface name
-                            validate_name(name, "Interface")?;
-                            
-                            // Remove State suffix if present
-                            let base_name = remove_state_suffix(name);
-                            
-                            // Convert to kebab-case for file name and interface name
-                            kebab_interface_name = Some(to_kebab_case(&base_name));
-                            
-                            println!("Interface name: {:?}", interface_name);
-                            println!("Base name: {}", base_name);
-                            println!("Kebab interface name: {:?}", kebab_interface_name);
-                        }
-                        
-                        if let (Some(ref iface_name), Some(ref kebab_name)) = (&interface_name, &kebab_interface_name) {
-                            // We already validated the interface name, so the file name should be fine
-                            
-                            // Generate the WIT content
-                            let content = generate_interface_wit_content(impl_item, iface_name, &ast)?;
-                            
-                            if !content.is_empty() {
-                                // Write the interface file with kebab-case name
-                                let interface_file = api_dir.join(format!("{}.wit", kebab_name));
-                                println!("Writing WIT file to {}", interface_file.display());
-                                
-                                fs::write(&interface_file, &content)
-                                    .with_context(|| format!("Failed to write {}", interface_file.display()))?;
-                                
-                                println!("Successfully wrote WIT file");
-                            } else {
-                                println!("Generated WIT content is empty, skipping file creation");
-                            }
-                        }
-                    },
-                    Err(e) => println!("Failed to extract wit_world: {}", e),
-                }
-            }
-        }
-    }
-    
-    if let (Some(_), Some(_), Some(kebab_iface)) = (wit_world, interface_name, kebab_interface_name) {
-        println!("Returning import statement for interface {}", kebab_iface);
-        // Use kebab-case interface name for import
-        Ok(Some(format!("    import {};", kebab_iface)))
-    } else {
-        println!("No valid interface found");
-        Ok(None)
     }
 }
 
